@@ -69,6 +69,8 @@ pub enum ProfileManagerError {
     ServiceError(#[from] ServiceError),
     #[error(transparent)]
     ProfileCipherError(#[from] ProfileCipherError),
+    #[error("failed to read avatar: {0}")]
+    AvatarIoError(#[from] std::io::Error),
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
@@ -78,6 +80,11 @@ pub struct Profile {
     pub about_emoji: Option<String>,
     pub avatar: Option<String>,
     pub unrestricted_unidentified_access: bool,
+    /// Decrypted, protobuf-encoded
+    /// [`PaymentAddress`][crate::proto::PaymentAddress] bytes (kept as bytes
+    /// so this struct stays serde-serializable).
+    #[serde(default)]
+    pub payment_address: Option<Vec<u8>>,
 }
 
 impl AccountManager {
@@ -585,6 +592,7 @@ impl AccountManager {
             name,
             about,
             about_emoji,
+            None,
             if retain_avatar {
                 AvatarWrite::RetainAvatar
             } else {
@@ -616,7 +624,11 @@ impl AccountManager {
     ///
     /// Panics if no `profile_key` was set.
     ///
-    /// Returns the avatar url path.
+    /// A profile write replaces the whole profile server-side, so a `None`
+    /// `payment_address` clears any previously stored address (fetch the
+    /// current profile first to retain it).
+    ///
+    /// Returns the avatar CDN key when a new avatar was uploaded.
     pub async fn upload_versioned_profile<
         's,
         C: std::io::Read + Send + 's,
@@ -628,7 +640,8 @@ impl AccountManager {
         name: ProfileName<S>,
         about: Option<String>,
         about_emoji: Option<String>,
-        avatar: AvatarWrite<&'s mut C>,
+        payment_address: Option<&crate::proto::PaymentAddress>,
+        mut avatar: AvatarWrite<&'s mut C>,
         csprng: &mut R,
     ) -> Result<Option<String>, ProfileManagerError> {
         let profile_key =
@@ -641,29 +654,65 @@ impl AccountManager {
         let about = profile_cipher.encrypt_about(about, csprng)?;
         let about_emoji = about_emoji.unwrap_or_default();
         let about_emoji = profile_cipher.encrypt_emoji(about_emoji, csprng)?;
+        let payment_address = payment_address
+            .map(|address| {
+                profile_cipher.encrypt_payment_address(address, csprng)
+            })
+            .transpose()?;
 
-        // If avatar -> upload
-        if matches!(avatar, AvatarWrite::NewAvatar(_)) {
-            // FIXME ProfileCipherOutputStream.java
-            // It's just AES GCM, but a bit of work to decently implement it with a stream.
-            unimplemented!("Setting avatar requires ProfileCipherStream")
-        }
+        // Java: ProfileCipherOutputStream — plain AES-GCM over the image
+        // bytes; avatars are small, so encrypt in one buffer.
+        let encrypted_avatar = match &mut avatar {
+            AvatarWrite::NewAvatar(cursor) => {
+                let mut bytes = Vec::new();
+                cursor.read_to_end(&mut bytes)?;
+                Some(profile_cipher.encrypt_avatar(bytes, csprng)?)
+            },
+            AvatarWrite::RetainAvatar | AvatarWrite::NoAvatar => None,
+        };
 
         let profile_key = profile_cipher.into_inner();
         let commitment = profile_key.get_commitment(aci);
         let profile_key_version = profile_key.get_profile_key_version(aci);
 
-        Ok(self
+        let upload_form = self
             .websocket
             .write_profile::<C, S>(
                 &profile_key_version,
                 &name,
                 &about,
                 &about_emoji,
+                payment_address,
                 &commitment,
-                avatar,
+                &avatar,
             )
-            .await?)
+            .await?;
+
+        match (upload_form, encrypted_avatar) {
+            (Some(attributes), Some(encrypted)) => {
+                let avatar_key = attributes.key.clone();
+                self.service
+                    .upload_to_cdn0(
+                        "",
+                        attributes,
+                        "file".into(),
+                        &encrypted[..],
+                    )
+                    .await?;
+                Ok(Some(avatar_key))
+            },
+            (None, None) => Ok(None),
+            (Some(_), None) => {
+                tracing::warn!(
+                    "server sent an avatar upload form without a new avatar; ignoring"
+                );
+                Ok(None)
+            },
+            (None, Some(_)) => Err(ServiceError::InvalidFrame {
+                reason: "server did not return an avatar upload form",
+            }
+            .into()),
+        }
     }
 
     /// Set profile attributes

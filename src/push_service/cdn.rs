@@ -23,13 +23,13 @@ use super::{response::ReqwestExt, PushService, ServiceError};
 #[derive(Debug, serde::Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AttachmentV2UploadAttributes {
-    key: String,
-    credential: String,
-    acl: String,
-    algorithm: String,
-    date: String,
-    policy: String,
-    signature: String,
+    pub key: String,
+    pub credential: String,
+    pub acl: String,
+    pub algorithm: String,
+    pub date: String,
+    pub policy: String,
+    pub signature: String,
 }
 
 #[derive(Debug, Deserialize)]
