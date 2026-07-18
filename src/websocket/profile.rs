@@ -5,7 +5,7 @@ use zkgroup::profiles::{ProfileKeyCommitment, ProfileKeyVersion};
 
 use crate::{
     content::ServiceError,
-    push_service::AvatarWrite,
+    push_service::{AttachmentV2UploadAttributes, AvatarWrite},
     utils::{serde_base64, serde_optional_base64},
     websocket::{self, account::DeviceCapabilities, SignalWebSocket},
 };
@@ -55,9 +55,8 @@ pub struct SignalServiceProfile {
     #[serde(default, with = "serde_optional_base64")]
     pub about_emoji: Option<Vec<u8>>,
 
-    // TODO: not sure whether this is via optional_base64
-    // #[serde(default, with = "serde_optional_base64")]
-    // pub payment_address: Option<Vec<u8>>,
+    #[serde(default, with = "serde_optional_base64")]
+    pub payment_address: Option<Vec<u8>>,
     pub avatar: Option<String>,
     pub unidentified_access: Option<String>,
 
@@ -82,6 +81,10 @@ struct SignalServiceProfileWrite<'s> {
     about: &'s [u8],
     #[serde(with = "serde_base64")]
     about_emoji: &'s [u8],
+    /// Encrypted [`PaymentAddress`][crate::proto::PaymentAddress]. A profile
+    /// write replaces the whole profile, so `None` clears any stored address.
+    #[serde(with = "serde_optional_base64")]
+    payment_address: Option<Vec<u8>>,
     avatar: bool,
     same_avatar: bool,
     #[serde(with = "serde_base64")]
@@ -113,9 +116,13 @@ impl SignalWebSocket<websocket::Identified> {
             .await
     }
 
-    /// Writes a profile and returns the avatar URL, if one was provided.
+    /// Writes a profile. When a new avatar is announced, returns the CDN0
+    /// upload form the server hands back (Java:
+    /// `ProfileAvatarUploadAttributes`); the caller is responsible for
+    /// uploading the encrypted avatar with it.
     ///
-    /// The name, about and emoji fields are encrypted with an [`ProfileCipher`][struct@crate::profile_cipher::ProfileCipher].
+    /// All binary fields are encrypted with a
+    /// [`ProfileCipher`][struct@crate::profile_cipher::ProfileCipher].
     /// See [`AccountManager`][struct@crate::AccountManager] for a convenience method.
     ///
     /// Java equivalent: `writeProfile`
@@ -125,9 +132,10 @@ impl SignalWebSocket<websocket::Identified> {
         name: &[u8],
         about: &[u8],
         emoji: &[u8],
+        payment_address: Option<Vec<u8>>,
         commitment: &ProfileKeyCommitment,
-        avatar: AvatarWrite<&mut C>,
-    ) -> Result<Option<String>, ServiceError>
+        avatar: &AvatarWrite<&mut C>,
+    ) -> Result<Option<AttachmentV2UploadAttributes>, ServiceError>
     where
         C: std::io::Read + Send + 's,
         S: AsRef<str>,
@@ -143,41 +151,24 @@ impl SignalWebSocket<websocket::Identified> {
             name,
             about,
             about_emoji: emoji,
+            payment_address,
             avatar: !matches!(avatar, AvatarWrite::NoAvatar),
             same_avatar: matches!(avatar, AvatarWrite::RetainAvatar),
             commitment: &commitment,
         };
 
-        // XXX this should  be a struct; cfr ProfileAvatarUploadAttributes
-        let upload_url: Result<String, _> = self
+        let response = self
             .http_request(Method::PUT, "/v1/profile")?
             .send_json(&command)
             .await?
             .service_error_for_status()
-            .await?
-            .json()
-            .await;
+            .await?;
 
-        match (upload_url, avatar) {
-            (_url, AvatarWrite::NewAvatar(_avatar)) => {
-                // FIXME
-                unreachable!("Uploading avatar unimplemented");
-            },
-            // FIXME cleanup when #54883 is stable and MSRV:
-            // or-patterns syntax is experimental
-            // see issue #54883 <https://github.com/rust-lang/rust/issues/54883> for more information
-            (Err(_), AvatarWrite::RetainAvatar)
-            | (Err(_), AvatarWrite::NoAvatar) => {
-                // OWS sends an empty string when there's no attachment
-                Ok(None)
-            },
-            (Ok(_resp), AvatarWrite::RetainAvatar)
-            | (Ok(_resp), AvatarWrite::NoAvatar) => {
-                tracing::warn!(
-                    "No avatar supplied but got avatar upload URL. Ignoring"
-                );
-                Ok(None)
-            },
+        if matches!(avatar, AvatarWrite::NewAvatar(_)) {
+            Ok(Some(response.json().await?))
+        } else {
+            // OWS sends an empty string when there's no attachment.
+            Ok(None)
         }
     }
 }
