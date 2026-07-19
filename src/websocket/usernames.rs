@@ -187,7 +187,162 @@ fn parse_username_link(
     Ok((handle_uuid, *entropy))
 }
 
+/// A confirmed username: the account's new username, its server-assigned
+/// link handle, and the link entropy needed to reconstruct the shareable
+/// URL (via [`generate_username_link`]).
+pub struct ConfirmedUsername {
+    pub username: usernames::Username,
+    pub link_handle: uuid::Uuid,
+    pub link_entropy: [u8; usernames::constants::USERNAME_LINK_ENTROPY_SIZE],
+}
+
+impl ConfirmedUsername {
+    pub fn link(&self) -> url::Url {
+        generate_username_link(self.link_handle, &self.link_entropy)
+    }
+}
+
 impl SignalWebSocket<Identified> {
+    /// Reserves one of the candidate usernames and returns the index of the
+    /// winning candidate.
+    ///
+    /// The reservation is tentative until [`Self::confirm_username`] is
+    /// called. Server: HTTP 409 when every candidate is taken, 429 when
+    /// rate-limited.
+    ///
+    /// Java equivalent: `AccountApi.reserveUsername`
+    pub async fn reserve_username(
+        &mut self,
+        candidates: &[usernames::Username],
+    ) -> Result<usize, ServiceError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct ReserveUsernameRequest {
+            username_hashes: Vec<String>,
+        }
+
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct ReserveUsernameResponse {
+            #[serde(with = "serde_base64_url_safe_no_pad")]
+            username_hash: Vec<u8>,
+        }
+
+        let hashes: Vec<[u8; 32]> =
+            candidates.iter().map(|c| c.hash()).collect();
+        let response = self
+            .http_request(Method::PUT, "/v1/accounts/username_hash/reserve")?
+            .send_json(ReserveUsernameRequest {
+                username_hashes: hashes
+                    .iter()
+                    .map(|hash| BASE64_URL_SAFE_NO_PAD.encode(hash))
+                    .collect(),
+            })
+            .await?
+            .service_error_for_status()
+            .await?;
+        let result: ReserveUsernameResponse = response.json().await?;
+
+        hashes
+            .iter()
+            .position(|hash| hash[..] == result.username_hash[..])
+            .ok_or(ServiceError::InvalidFrame {
+                reason: "server reserved a hash we did not offer",
+            })
+    }
+
+    /// Confirms a username previously reserved with
+    /// [`Self::reserve_username`], simultaneously establishing its username
+    /// link (the `encryptedUsername` sent along is the link blob).
+    ///
+    /// Server: HTTP 409 when the reservation is missing or does not match,
+    /// 410 when the username has become unavailable, 429 when rate-limited.
+    ///
+    /// Java equivalent: `AccountApi.confirmUsername`
+    pub async fn confirm_username(
+        &mut self,
+        username: usernames::Username,
+        link_entropy: Option<
+            &[u8; usernames::constants::USERNAME_LINK_ENTROPY_SIZE],
+        >,
+    ) -> Result<ConfirmedUsername, ServiceError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct ConfirmUsernameRequest {
+            #[serde(with = "serde_base64_url_safe_no_pad")]
+            username_hash: Vec<u8>,
+            #[serde(with = "serde_base64_url_safe_no_pad")]
+            zk_proof: Vec<u8>,
+            #[serde(with = "serde_base64_url_safe_no_pad")]
+            encrypted_username: Vec<u8>,
+        }
+
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct ConfirmUsernameResponse {
+            username_link_handle: uuid::Uuid,
+        }
+
+        let mut rng = rand::rng();
+        let randomness: [u8; 32] = rand::Rng::random(&mut rng);
+        let proof = username.proof(&randomness).map_err(|error| {
+            tracing::error!(%error, "failed to generate username proof");
+            ServiceError::InvalidFrame {
+                reason: "failed to generate username proof",
+            }
+        })?;
+        // Passing the previous link entropy back in reclaims the existing
+        // link URL; `None` mints a fresh link.
+        let (entropy, ciphertext) = usernames::create_for_username(
+            &mut rng,
+            username.to_string(),
+            link_entropy,
+        )
+        .map_err(|_e| ServiceError::InvalidFrame {
+            reason: "username too long to encrypt",
+        })?;
+
+        let response = self
+            .http_request(Method::PUT, "/v1/accounts/username_hash/confirm")?
+            .send_json(ConfirmUsernameRequest {
+                username_hash: username.hash().to_vec(),
+                zk_proof: proof,
+                encrypted_username: ciphertext,
+            })
+            .await?
+            .service_error_for_status()
+            .await?;
+        let result: ConfirmUsernameResponse = response.json().await?;
+
+        Ok(ConfirmedUsername {
+            username,
+            link_handle: result.username_link_handle,
+            link_entropy: entropy,
+        })
+    }
+
+    /// Clears the account's username (and thereby its username link).
+    ///
+    /// Java equivalent: `AccountApi.deleteUsername`
+    pub async fn delete_username(&mut self) -> Result<(), ServiceError> {
+        self.http_request(Method::DELETE, "/v1/accounts/username_hash")?
+            .send()
+            .await?
+            .service_error_for_status()
+            .await?;
+        Ok(())
+    }
+
+    /// Deletes the account's username link (the username itself remains).
+    pub async fn delete_username_link(&mut self) -> Result<(), ServiceError> {
+        self.http_request(Method::DELETE, "/v1/accounts/username_link")?
+            .send()
+            .await?
+            .service_error_for_status()
+            .await?;
+        Ok(())
+    }
+
     /// Sets the account's username link to encrypt `username` and returns the
     /// shareable `https://signal.me/#eu/...` link.
     ///
