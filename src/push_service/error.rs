@@ -37,6 +37,8 @@ pub enum ServiceError {
     JsonDecodeError(#[from] serde_json::Error),
     #[error("Error decoding protobuf frame: {0}")]
     ProtobufDecodeError(#[from] prost::DecodeError),
+    #[error("Error encoding protobuf frame: {0}")]
+    ProtobufEncodeError(#[from] prost::EncodeError),
     #[error("error encoding or decoding bincode: {0}")]
     BincodeError(#[from] bincode::Error),
     #[error("error decoding base64 string: {0}")]
@@ -94,6 +96,14 @@ pub enum ServiceError {
 
     #[error("groups v2 (zero-knowledge) error")]
     GroupsV2Error,
+
+    /// The groups server rejected a change because the revision was stale.
+    ///
+    /// Another change landed between the state fetch and the PATCH. The
+    /// actions must be rebuilt against refetched state; replaying the same
+    /// body will conflict again.
+    #[error("group change conflicted with a newer revision")]
+    GroupPatchConflict,
 
     #[error(transparent)]
     GroupsV2DecryptionError(#[from] GroupDecodingError),

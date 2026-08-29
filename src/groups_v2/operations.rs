@@ -1057,12 +1057,244 @@ impl GroupOperations {
             },
         )
     }
+
+    /// Builds an empty [`Actions`] envelope for a change at `revision`.
+    ///
+    /// `revision` must be the current group revision **plus one**; the server
+    /// rejects anything else with 409 Conflict. Populate the returned envelope
+    /// with the relevant action lists before submitting.
+    ///
+    /// `source_aci` is left unencrypted-by-us on purpose: the server derives
+    /// and stamps `sourceUserId` from the authenticated presentation. Likewise
+    /// `group_id` is deliberately left empty — clients that set it get a 400
+    /// (see `groups.proto`), since the server binds its signature to the group
+    /// itself.
+    ///
+    /// [`Actions`]: proto::group_change::Actions
+    pub fn build_actions(
+        &self,
+        revision: u32,
+    ) -> proto::group_change::Actions {
+        proto::group_change::Actions {
+            version: revision,
+            ..Default::default()
+        }
+    }
+
+    /// Builds the actions for leaving a group — deleting your own membership.
+    ///
+    /// This is the same `DeleteMemberAction` used to remove anyone else; the
+    /// server authorises it because the presentation proves you are the member
+    /// being removed. Last-admin policy is a caller concern, not enforced here.
+    pub fn build_leave_group_actions(
+        &self,
+        self_aci: Aci,
+        revision: u32,
+    ) -> Result<proto::group_change::Actions, GroupDecodingError> {
+        let mut actions = self.build_actions(revision);
+        actions.delete_members =
+            vec![self.build_remove_member_action(self_aci)?];
+        Ok(actions)
+    }
+
+    /// Builds actions setting a new group title.
+    pub fn build_modify_title_actions<R: rand::Rng + rand::CryptoRng>(
+        &self,
+        title: &str,
+        revision: u32,
+        rng: &mut R,
+    ) -> proto::group_change::Actions {
+        let mut actions = self.build_actions(revision);
+        actions.modify_title =
+            Some(proto::group_change::actions::ModifyTitleAction {
+                title: self.encrypt_title(title, rng),
+            });
+        actions
+    }
+
+    /// Builds actions setting a new group description.
+    ///
+    /// Passing `None` clears the description.
+    pub fn build_modify_description_actions<R: rand::Rng + rand::CryptoRng>(
+        &self,
+        description: Option<&str>,
+        revision: u32,
+        rng: &mut R,
+    ) -> proto::group_change::Actions {
+        let mut actions = self.build_actions(revision);
+        actions.modify_description =
+            Some(proto::group_change::actions::ModifyDescriptionAction {
+                description: self.encrypt_description(description, rng),
+            });
+        actions
+    }
+
+    /// Builds actions setting the disappearing-message timer.
+    ///
+    /// Passing `None` disables disappearing messages.
+    pub fn build_modify_timer_actions<R: rand::Rng + rand::CryptoRng>(
+        &self,
+        timer: Option<&Timer>,
+        revision: u32,
+        rng: &mut R,
+    ) -> proto::group_change::Actions {
+        let mut actions = self.build_actions(revision);
+        actions.modify_disappearing_message_timer = Some(
+            proto::group_change::actions::ModifyDisappearingMessageTimerAction {
+                timer: self.encrypt_disappearing_messages_timer(timer, rng),
+            },
+        );
+        actions
+    }
+
+    /// Builds actions promoting or demoting a member.
+    ///
+    /// Note this is the *only* way to make someone an administrator: the server
+    /// rejects an `AddMemberAction` that carries a non-default role, so a new
+    /// admin must be added first and promoted after.
+    pub fn build_modify_member_role_actions(
+        &self,
+        aci: Aci,
+        role: super::model::Role,
+        revision: u32,
+    ) -> Result<proto::group_change::Actions, GroupDecodingError> {
+        let mut actions = self.build_actions(revision);
+        actions.modify_member_roles =
+            vec![proto::group_change::actions::ModifyMemberRoleAction {
+                user_id: self.encrypt_aci(aci)?,
+                role: role.into(),
+            }];
+        Ok(actions)
+    }
+
+    /// Builds actions removing several members at once.
+    pub fn build_remove_members_actions(
+        &self,
+        acis: impl IntoIterator<Item = Aci>,
+        revision: u32,
+    ) -> Result<proto::group_change::Actions, GroupDecodingError> {
+        let mut actions = self.build_actions(revision);
+        actions.delete_members = acis
+            .into_iter()
+            .map(|aci| self.build_remove_member_action(aci))
+            .collect::<Result<_, _>>()?;
+        Ok(actions)
+    }
+
+    /// Builds actions removing full members *and* revoking outstanding
+    /// invitations in one change.
+    ///
+    /// A pending member is not in `members` yet, so removing them requires a
+    /// `DeleteMemberPendingProfileKeyAction` rather than a
+    /// `DeleteMemberAction` — using the wrong one silently does nothing.
+    /// Callers that mean "get this person out of the group" generally want
+    /// both, since they may not know which state the target is in.
+    pub fn build_remove_members_and_invites_actions(
+        &self,
+        member_acis: impl IntoIterator<Item = Aci>,
+        pending_service_ids: impl IntoIterator<Item = ServiceId>,
+        revision: u32,
+    ) -> Result<proto::group_change::Actions, GroupDecodingError> {
+        let mut actions = self.build_actions(revision);
+        actions.delete_members = member_acis
+            .into_iter()
+            .map(|aci| self.build_remove_member_action(aci))
+            .collect::<Result<_, _>>()?;
+        actions.delete_members_pending_profile_key = pending_service_ids
+            .into_iter()
+            .map(|id| self.build_remove_pending_member_action(id))
+            .collect::<Result<_, _>>()?;
+        Ok(actions)
+    }
+
+    /// Builds actions adding members, splitting each into a full add or an
+    /// invite depending on whether we hold a credential for them.
+    ///
+    /// Candidates with a credential become full members (added with a
+    /// presentation, always at `Role::Default` — the server rejects adding
+    /// someone straight to administrator). Candidates without one are invited
+    /// as pending members, which is what Signal's clients do when a profile
+    /// key is unavailable.
+    pub fn build_add_members_actions(
+        &self,
+        server_public_params: &ServerPublicParams,
+        candidates: &[GroupMemberCandidate],
+        added_by_aci: Aci,
+        revision: u32,
+    ) -> Result<proto::group_change::Actions, GroupDecodingError> {
+        let mut actions = self.build_actions(revision);
+
+        for candidate in candidates {
+            match &candidate.credential {
+                Some(credential) => {
+                    let presentation = self.create_member_presentation(
+                        server_public_params,
+                        credential,
+                    );
+                    actions.add_members.push(
+                        proto::group_change::actions::AddMemberAction {
+                            added: Some(proto::Member {
+                                // Server extracts both from the presentation.
+                                user_id: vec![],
+                                profile_key: vec![],
+                                presentation,
+                                role: proto::member::Role::Default.into(),
+                                joined_at_version: 0,
+                                label_emoji: vec![],
+                                label_string: vec![],
+                            }),
+                            join_from_invite_link: false,
+                        },
+                    );
+                },
+                None => {
+                    actions.add_members_pending_profile_key.push(
+                        self.build_add_pending_member_action(
+                            candidate.service_id,
+                            added_by_aci,
+                            super::model::Role::Default,
+                        )?,
+                    );
+                },
+            }
+        }
+
+        Ok(actions)
+    }
+
+    /// Builds actions accepting our own invitation to a group.
+    ///
+    /// Promoting a pending member is authorised by presenting our own profile
+    /// key credential — the server moves the entry from
+    /// `members_pending_profile_key` into `members`. `user_id` and
+    /// `profile_key` are left empty: the server extracts both from the
+    /// presentation, exactly as at group creation.
+    pub fn build_promote_pending_member_actions(
+        &self,
+        server_public_params: &ServerPublicParams,
+        self_credential: &ExpiringProfileKeyCredential,
+        revision: u32,
+    ) -> proto::group_change::Actions {
+        let presentation = self
+            .create_member_presentation(server_public_params, self_credential);
+
+        let mut actions = self.build_actions(revision);
+        actions.promote_members_pending_profile_key = vec![
+            proto::group_change::actions::PromoteMemberPendingProfileKeyAction {
+                presentation,
+                user_id: vec![],
+                profile_key: vec![],
+            },
+        ];
+        actions
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use super::super::model::Role;
     use rand::RngCore;
     use zkgroup::groups::GroupMasterKey;
 
@@ -1200,5 +1432,179 @@ mod tests {
         assert_ne!(encrypted1, encrypted2);
         assert_eq!(ops.decrypt_title(&encrypted1), title);
         assert_eq!(ops.decrypt_title(&encrypted2), title);
+    }
+
+    fn test_aci() -> Aci {
+        Aci::parse_from_service_id_string(
+            "8b73e2e4-6a3f-4e1d-9c2a-1f0b5d6e7a8c",
+        )
+        .expect("valid test ACI")
+    }
+
+    #[test]
+    fn actions_envelope_sets_revision_and_leaves_server_fields_empty() {
+        let ops = create_group_operations();
+        let actions = ops.build_actions(8);
+
+        assert_eq!(actions.version, 8);
+        // The server stamps sourceUserId from the authenticated presentation,
+        // and rejects any request that sets group_id with a 400.
+        assert!(actions.source_user_id.is_empty());
+        assert!(actions.group_id.is_empty());
+    }
+
+    #[test]
+    fn leave_group_actions_delete_only_self_at_next_revision() {
+        let ops = create_group_operations();
+        let aci = test_aci();
+
+        // Group is at revision 4, so the change must be submitted at 5.
+        let actions = ops
+            .build_leave_group_actions(aci, 5)
+            .expect("leave actions build");
+
+        assert_eq!(actions.version, 5);
+        assert_eq!(actions.delete_members.len(), 1);
+        assert!(actions.add_members.is_empty());
+
+        // The deleted user id must be the encrypted form of our own ACI, not
+        // the plaintext — the groups server never sees raw service IDs.
+        let deleted = &actions.delete_members[0].deleted_user_id;
+        assert_eq!(
+            ops.decrypt_aci(deleted).expect("decrypts back to self"),
+            aci
+        );
+        assert_ne!(deleted.as_slice(), aci.service_id_binary().as_slice());
+    }
+
+    #[test]
+    fn modify_title_actions_encrypt_the_title_at_next_revision() {
+        let ops = create_group_operations();
+        let mut rng = rand::rng();
+
+        let actions = ops.build_modify_title_actions("New Title", 7, &mut rng);
+
+        assert_eq!(actions.version, 7);
+        let encrypted = &actions.modify_title.as_ref().unwrap().title;
+        assert_eq!(ops.decrypt_title(encrypted), "New Title");
+        // Title must never travel in the clear.
+        assert_ne!(encrypted.as_slice(), b"New Title");
+    }
+
+    #[test]
+    fn modify_timer_actions_roundtrip_and_clear() {
+        let ops = create_group_operations();
+        let mut rng = rand::rng();
+
+        let timer = Timer { duration: 86400 };
+        let actions = ops.build_modify_timer_actions(Some(&timer), 3, &mut rng);
+        let encrypted = &actions
+            .modify_disappearing_message_timer
+            .as_ref()
+            .unwrap()
+            .timer;
+        assert_eq!(
+            ops.decrypt_disappearing_messages_timer(encrypted),
+            Some(timer)
+        );
+
+        // None disables disappearing messages, which on the wire is a timer of
+        // zero duration rather than an absent blob — the action still has to
+        // carry a ciphertext for the server to apply the change.
+        let cleared = ops.build_modify_timer_actions(None, 4, &mut rng);
+        let encrypted = &cleared
+            .modify_disappearing_message_timer
+            .as_ref()
+            .unwrap()
+            .timer;
+        assert!(!encrypted.is_empty());
+        assert_eq!(
+            ops.decrypt_disappearing_messages_timer(encrypted),
+            Some(Timer { duration: 0 })
+        );
+    }
+
+    #[test]
+    fn modify_member_role_actions_encrypt_the_target() {
+        let ops = create_group_operations();
+        let aci = test_aci();
+
+        let actions = ops
+            .build_modify_member_role_actions(aci, Role::Administrator, 9)
+            .expect("role actions build");
+
+        assert_eq!(actions.version, 9);
+        assert_eq!(actions.modify_member_roles.len(), 1);
+        let action = &actions.modify_member_roles[0];
+        assert_eq!(action.role, proto::member::Role::Administrator as i32);
+        assert_eq!(ops.decrypt_aci(&action.user_id).unwrap(), aci);
+    }
+
+    #[test]
+    fn remove_members_actions_cover_every_target() {
+        let ops = create_group_operations();
+        let a = test_aci();
+        let b = Aci::parse_from_service_id_string(
+            "1a2b3c4d-5e6f-4a8b-9c0d-1e2f3a4b5c6d",
+        )
+        .expect("valid aci");
+
+        let actions = ops
+            .build_remove_members_actions([a, b], 2)
+            .expect("remove actions build");
+
+        assert_eq!(actions.delete_members.len(), 2);
+        let removed: Vec<Aci> = actions
+            .delete_members
+            .iter()
+            .map(|m| ops.decrypt_aci(&m.deleted_user_id).unwrap())
+            .collect();
+        assert!(removed.contains(&a) && removed.contains(&b));
+    }
+
+    #[test]
+    fn add_members_actions_split_credentialed_from_invited() {
+        let ops = create_group_operations();
+        let inviter = test_aci();
+
+        // Without a credential a candidate must become a pending invite, never
+        // a silently dropped member.
+        let candidates = vec![GroupMemberCandidate {
+            service_id: ServiceId::from(inviter),
+            credential: None,
+        }];
+
+        let params = zkgroup::ServerSecretParams::generate([0u8; 32]);
+        let actions = ops
+            .build_add_members_actions(
+                &params.get_public_params(),
+                &candidates,
+                inviter,
+                5,
+            )
+            .expect("add actions build");
+
+        assert_eq!(actions.version, 5);
+        assert!(actions.add_members.is_empty());
+        assert_eq!(actions.add_members_pending_profile_key.len(), 1);
+    }
+
+    #[test]
+    fn leave_group_actions_roundtrip_through_prost() {
+        let ops = create_group_operations();
+        let actions = ops
+            .build_leave_group_actions(test_aci(), 12)
+            .expect("leave actions build");
+
+        // This is exactly what goes in the PATCH body.
+        let encoded = prost::Message::encode_to_vec(&actions);
+        let decoded =
+            <proto::group_change::Actions as prost::Message>::decode(
+                encoded.as_slice(),
+            )
+            .expect("actions roundtrip through prost");
+
+        assert_eq!(decoded, actions);
+        assert_eq!(decoded.version, 12);
     }
 }

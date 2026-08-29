@@ -8,7 +8,7 @@ use crate::{
 };
 
 use libsignal_core::DeviceId;
-use protobuf::ProtobufResponseExt;
+use protobuf::{ProtobufRequestBuilderExt, ProtobufResponseExt};
 use reqwest::{Method, RequestBuilder};
 use reqwest_websocket::Upgrade;
 use serde::{Deserialize, Serialize};
@@ -195,6 +195,90 @@ impl PushService {
         self.request(
             Method::GET,
             Endpoint::storage("/v1/groups/"),
+            HttpAuthOverride::Identified(credentials),
+        )?
+        .send()
+        .await?
+        .service_error_for_status()
+        .await?
+        .protobuf()
+        .await
+    }
+
+    /// Creates a new group on the groups server.
+    ///
+    /// `group` must be fully encrypted already, at revision 0, with the
+    /// creator's own membership carrying a profile key credential
+    /// presentation. The server validates the presentations and stores the
+    /// group; it returns no body.
+    ///
+    /// Java equivalent: `PushServiceSocket.putNewGroupsV2Group`.
+    pub(crate) async fn create_group(
+        &mut self,
+        credentials: HttpAuth,
+        group: crate::proto::Group,
+    ) -> Result<(), ServiceError> {
+        self.request(
+            Method::PUT,
+            Endpoint::storage("/v1/groups/"),
+            HttpAuthOverride::Identified(credentials),
+        )?
+        .protobuf(group)?
+        .send()
+        .await?
+        .service_error_for_status()
+        .await?;
+        Ok(())
+    }
+
+    /// Submits a group change and returns the server-signed result.
+    ///
+    /// `actions` must be built at `revision = current + 1`. If another change
+    /// landed first the server responds 409 Conflict, surfaced here as
+    /// [`ServiceError::GroupPatchConflict`]; callers must refetch the current
+    /// state and rebuild the actions rather than retrying the same body.
+    ///
+    /// Java equivalent: `PushServiceSocket.patchGroupsV2Group`.
+    pub(crate) async fn patch_group(
+        &mut self,
+        credentials: HttpAuth,
+        actions: crate::proto::group_change::Actions,
+    ) -> Result<crate::proto::GroupChange, ServiceError> {
+        let response = self
+            .request(
+                Method::PATCH,
+                Endpoint::storage("/v1/groups/"),
+                HttpAuthOverride::Identified(credentials),
+            )?
+            .protobuf(actions)?
+            .send()
+            .await?;
+
+        if response.status() == reqwest::StatusCode::CONFLICT {
+            return Err(ServiceError::GroupPatchConflict);
+        }
+
+        response
+            .service_error_for_status()
+            .await?
+            .protobuf()
+            .await
+    }
+
+    /// Fetches the group change log from `from_revision` (inclusive) onward.
+    ///
+    /// Lets a client that is only a few revisions behind apply signed changes
+    /// in order instead of refetching full state.
+    ///
+    /// Java equivalent: `PushServiceSocket.getGroupsV2Logs`.
+    pub(crate) async fn get_group_logs(
+        &mut self,
+        credentials: HttpAuth,
+        from_revision: u32,
+    ) -> Result<crate::proto::GroupChanges, ServiceError> {
+        self.request(
+            Method::GET,
+            Endpoint::storage(format!("/v1/groups/logs/{from_revision}")),
             HttpAuthOverride::Identified(credentials),
         )?
         .send()

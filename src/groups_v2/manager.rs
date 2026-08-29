@@ -134,6 +134,7 @@ impl<T: CredentialsCache> CredentialsCache for &mut T {
 pub struct GroupsManager<C: CredentialsCache> {
     service_ids: ServiceIds,
     identified_push_service: PushService,
+    identified_websocket: SignalWebSocket<websocket::Identified>,
     unidentified_websocket: SignalWebSocket<websocket::Unidentified>,
     credentials_cache: C,
     server_public_params: ServerPublicParams,
@@ -143,6 +144,7 @@ impl<C: CredentialsCache> GroupsManager<C> {
     pub fn new(
         service_ids: ServiceIds,
         identified_push_service: PushService,
+        identified_websocket: SignalWebSocket<websocket::Identified>,
         unidentified_websocket: SignalWebSocket<websocket::Unidentified>,
         credentials_cache: C,
         server_public_params: ServerPublicParams,
@@ -150,6 +152,7 @@ impl<C: CredentialsCache> GroupsManager<C> {
         Self {
             service_ids,
             identified_push_service,
+            identified_websocket,
             unidentified_websocket,
             credentials_cache,
             server_public_params,
@@ -260,6 +263,102 @@ impl<C: CredentialsCache> GroupsManager<C> {
             .get_authorization_for_today(csprng, group_secret_params)
             .await?;
         self.identified_push_service.get_group(authorization).await
+    }
+
+    /// Fetches an expiring profile key credential for `aci`.
+    ///
+    /// Required to add someone as a *full* member (including yourself at
+    /// creation time). Returns `Ok(None)` when the server declines to issue
+    /// one — typically because the profile key we hold is stale — which the
+    /// caller should treat as "invite as pending member" rather than an error.
+    pub async fn fetch_profile_key_credential<R: Rng + CryptoRng>(
+        &mut self,
+        csprng: &mut R,
+        aci: libsignal_protocol::Aci,
+        profile_key: zkgroup::profiles::ProfileKey,
+    ) -> Result<Option<zkgroup::profiles::ExpiringProfileKeyCredential>, ServiceError>
+    {
+        let context = super::credentials::create_credential_request_context(
+            &self.server_public_params,
+            aci,
+            profile_key,
+            csprng,
+        );
+
+        let response = self
+            .identified_websocket
+            .retrieve_profile_with_credential(
+                aci,
+                profile_key,
+                &context.get_request(),
+            )
+            .await?;
+
+        let Some(credential_bytes) = response.credential else {
+            return Ok(None);
+        };
+
+        super::credentials::receive_credential(
+            &self.server_public_params,
+            &context,
+            &credential_bytes,
+            std::time::SystemTime::now(),
+        )
+        .map(Some)
+    }
+
+    /// Creates a group on the groups server.
+    ///
+    /// `encrypted_group` must be at revision 0 and already encrypted under
+    /// `group_secret_params` (see
+    /// [`GroupOperations::encrypt_group_with_credentials`]).
+    pub async fn create_encrypted_group<R: Rng + CryptoRng>(
+        &mut self,
+        csprng: &mut R,
+        group_secret_params: GroupSecretParams,
+        encrypted_group: crate::proto::Group,
+    ) -> Result<(), ServiceError> {
+        let authorization = self
+            .get_authorization_for_today(csprng, group_secret_params)
+            .await?;
+        self.identified_push_service
+            .create_group(authorization, encrypted_group)
+            .await
+    }
+
+    /// Submits a group change, returning the server-signed [`proto::GroupChange`].
+    ///
+    /// Surfaces [`ServiceError::GroupPatchConflict`] on a revision race; the
+    /// caller must refetch state and rebuild the actions.
+    ///
+    /// [`proto::GroupChange`]: crate::proto::GroupChange
+    pub async fn patch_encrypted_group<R: Rng + CryptoRng>(
+        &mut self,
+        csprng: &mut R,
+        group_secret_params: GroupSecretParams,
+        actions: crate::proto::group_change::Actions,
+    ) -> Result<crate::proto::GroupChange, ServiceError> {
+        let authorization = self
+            .get_authorization_for_today(csprng, group_secret_params)
+            .await?;
+        self.identified_push_service
+            .patch_group(authorization, actions)
+            .await
+    }
+
+    /// Fetches the signed change log from `from_revision` onward.
+    pub async fn fetch_group_logs<R: Rng + CryptoRng>(
+        &mut self,
+        csprng: &mut R,
+        group_secret_params: GroupSecretParams,
+        from_revision: u32,
+    ) -> Result<crate::proto::GroupChanges, ServiceError> {
+        let authorization = self
+            .get_authorization_for_today(csprng, group_secret_params)
+            .await?;
+        self.identified_push_service
+            .get_group_logs(authorization, from_revision)
+            .await
     }
 
     #[tracing::instrument(
