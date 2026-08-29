@@ -3,6 +3,7 @@ use std::{collections::HashMap, convert::TryInto};
 use crate::{
     configuration::Endpoint,
     groups_v2::{
+        invite_link::GroupInviteLink,
         model::{Group, GroupChanges},
         operations::{GroupDecodingError, GroupOperations},
     },
@@ -12,6 +13,8 @@ use crate::{
     utils::BASE64_RELAXED,
     websocket::{self, SignalWebSocket},
 };
+
+pub use crate::push_service::GroupLogsPage;
 
 use base64::prelude::*;
 use bytes::Bytes;
@@ -130,6 +133,11 @@ impl<T: CredentialsCache> CredentialsCache for &mut T {
         (**self).write(map)
     }
 }
+
+/// Highest `GroupChange.changeEpoch` whose actions [`GroupOperations`]
+/// decodes (member labels). The server elides newer action types from logs
+/// when asked for this epoch rather than failing the whole request.
+const MAX_SUPPORTED_CHANGE_EPOCH: u32 = 6;
 
 pub struct GroupsManager<C: CredentialsCache> {
     service_ids: ServiceIds,
@@ -276,8 +284,10 @@ impl<C: CredentialsCache> GroupsManager<C> {
         csprng: &mut R,
         aci: libsignal_protocol::Aci,
         profile_key: zkgroup::profiles::ProfileKey,
-    ) -> Result<Option<zkgroup::profiles::ExpiringProfileKeyCredential>, ServiceError>
-    {
+    ) -> Result<
+        Option<zkgroup::profiles::ExpiringProfileKeyCredential>,
+        ServiceError,
+    > {
         let context = super::credentials::create_credential_request_context(
             &self.server_public_params,
             aci,
@@ -346,18 +356,117 @@ impl<C: CredentialsCache> GroupsManager<C> {
             .await
     }
 
-    /// Fetches the signed change log from `from_revision` onward.
+    /// Fetches one page of the signed change log from `from_revision` onward.
+    ///
+    /// Callers wanting the full history loop on
+    /// [`GroupLogsPage::next_revision`]. `include_first_state` asks the server
+    /// to attach the full group state to the first entry.
     pub async fn fetch_group_logs<R: Rng + CryptoRng>(
         &mut self,
         csprng: &mut R,
         group_secret_params: GroupSecretParams,
         from_revision: u32,
-    ) -> Result<crate::proto::GroupChanges, ServiceError> {
+        include_first_state: bool,
+    ) -> Result<GroupLogsPage, ServiceError> {
         let authorization = self
             .get_authorization_for_today(csprng, group_secret_params)
             .await?;
         self.identified_push_service
-            .get_group_logs(authorization, from_revision)
+            .get_group_logs(
+                authorization,
+                from_revision,
+                MAX_SUPPORTED_CHANGE_EPOCH,
+                include_first_state,
+            )
+            .await
+    }
+
+    /// Encrypts and uploads a group avatar, returning the CDN key to put in
+    /// a `ModifyAvatarAction`.
+    ///
+    /// The upload form is single-use and specific to the group, so this must
+    /// be called once per avatar change, right before the PATCH.
+    pub async fn upload_group_avatar<R: Rng + CryptoRng>(
+        &mut self,
+        csprng: &mut R,
+        group_secret_params: GroupSecretParams,
+        avatar: &[u8],
+    ) -> Result<String, ServiceError> {
+        let encrypted = GroupOperations::new(group_secret_params)
+            .encrypt_avatar(avatar, csprng);
+
+        let authorization = self
+            .get_authorization_for_today(csprng, group_secret_params)
+            .await?;
+        let form = self
+            .identified_push_service
+            .get_group_avatar_upload_form(authorization)
+            .await?;
+        let key = form.key.clone();
+
+        // Same S3 form the profile avatar uses; only the field carrier differs.
+        let attributes = crate::push_service::AttachmentV2UploadAttributes {
+            key: form.key,
+            credential: form.credential,
+            acl: form.acl,
+            algorithm: form.algorithm,
+            date: form.date,
+            policy: form.policy,
+            signature: form.signature,
+        };
+        self.identified_push_service
+            .upload_to_cdn0("", attributes, "file".into(), &encrypted[..])
+            .await?;
+        Ok(key)
+    }
+
+    /// Fetches and decrypts the join preview for an invite link.
+    ///
+    /// `Unauthorized`/`Forbidden` here means the link is no longer valid
+    /// (disabled, or its password was rotated).
+    pub async fn fetch_group_join_info<R: Rng + CryptoRng>(
+        &mut self,
+        csprng: &mut R,
+        link: &GroupInviteLink,
+    ) -> Result<super::model::GroupJoinInfo, ServiceError> {
+        let group_secret_params = GroupSecretParams::derive_from_master_key(
+            GroupMasterKey::new(link.master_key),
+        );
+        let authorization = self
+            .get_authorization_for_today(csprng, group_secret_params)
+            .await?;
+        let info = self
+            .identified_push_service
+            .get_group_join_info(
+                authorization,
+                &GroupInviteLink::encode_password(&link.password),
+            )
+            .await?;
+        Ok(GroupOperations::new(group_secret_params)
+            .decrypt_group_join_info(info)?)
+    }
+
+    /// Submits a join (or join request) built with
+    /// [`GroupOperations::build_join_via_invite_link_actions`], authorised by
+    /// the link password rather than membership.
+    pub async fn patch_encrypted_group_via_invite_link<R: Rng + CryptoRng>(
+        &mut self,
+        csprng: &mut R,
+        link: &GroupInviteLink,
+        actions: crate::proto::group_change::Actions,
+    ) -> Result<crate::proto::GroupChange, ServiceError> {
+        let group_secret_params = GroupSecretParams::derive_from_master_key(
+            GroupMasterKey::new(link.master_key),
+        );
+        let authorization = self
+            .get_authorization_for_today(csprng, group_secret_params)
+            .await?;
+        self.identified_push_service
+            .patch_group_with_invite_link_password(
+                authorization,
+                actions,
+                &GroupInviteLink::encode_password(&link.password),
+            )
             .await
     }
 

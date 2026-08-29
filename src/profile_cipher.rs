@@ -178,10 +178,7 @@ impl ProfileCipher {
         Ok(concat)
     }
 
-    fn decrypt_raw(
-        &self,
-        bytes: &[u8],
-    ) -> Result<Vec<u8>, ProfileCipherError> {
+    fn decrypt_raw(&self, bytes: &[u8]) -> Result<Vec<u8>, ProfileCipherError> {
         if bytes.len() < 12 + 16 {
             return Err(ProfileCipherError::CiphertextTooShort);
         }
@@ -524,7 +521,8 @@ mod tests {
         // but avatars are not padded — content ending in zeroes is the one
         // lossy case, mirroring upstream Java behavior).
         let avatar = vec![0x89, 0x50, 0x4E, 0x47, 0x01, 0x02, 0x03];
-        let encrypted = cipher.encrypt_avatar(avatar.clone(), &mut rng).unwrap();
+        let encrypted =
+            cipher.encrypt_avatar(avatar.clone(), &mut rng).unwrap();
         assert_eq!(encrypted.len(), avatar.len() + 28);
         let decrypted = cipher.decrypt_avatar(&encrypted).unwrap();
         assert_eq!(decrypted, avatar);

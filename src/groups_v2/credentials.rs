@@ -185,9 +185,8 @@ impl SignalWebSocket<websocket::Identified> {
     ) -> Result<SignalServiceProfileWithCredential, ServiceError> {
         // Both the version and the request are transparently bincode-encoded
         // to hex strings, matching the path format the server expects.
-        let version = bincode::serialize(
-            &profile_key.get_profile_key_version(aci),
-        )?;
+        let version =
+            bincode::serialize(&profile_key.get_profile_key_version(aci))?;
         let version = std::str::from_utf8(&version)
             .expect("profile key version is a hex encoded string");
 

@@ -244,10 +244,38 @@ impl PushService {
         credentials: HttpAuth,
         actions: crate::proto::group_change::Actions,
     ) -> Result<crate::proto::GroupChange, ServiceError> {
+        self.patch_group_inner(credentials, actions, None).await
+    }
+
+    /// [`patch_group`][Self::patch_group] for a non-member joining through
+    /// an invite link: the link password, base64url-encoded, authorises the
+    /// change in place of membership.
+    pub(crate) async fn patch_group_with_invite_link_password(
+        &mut self,
+        credentials: HttpAuth,
+        actions: crate::proto::group_change::Actions,
+        password: &str,
+    ) -> Result<crate::proto::GroupChange, ServiceError> {
+        self.patch_group_inner(credentials, actions, Some(password))
+            .await
+    }
+
+    async fn patch_group_inner(
+        &mut self,
+        credentials: HttpAuth,
+        actions: crate::proto::group_change::Actions,
+        invite_link_password: Option<&str>,
+    ) -> Result<crate::proto::GroupChange, ServiceError> {
+        let path = match invite_link_password {
+            Some(password) => {
+                format!("/v1/groups/?inviteLinkPassword={password}")
+            },
+            None => "/v1/groups/".to_string(),
+        };
         let response = self
             .request(
                 Method::PATCH,
-                Endpoint::storage("/v1/groups/"),
+                Endpoint::storage(path),
                 HttpAuthOverride::Identified(credentials),
             )?
             .protobuf(actions)?
@@ -258,27 +286,24 @@ impl PushService {
             return Err(ServiceError::GroupPatchConflict);
         }
 
-        response
-            .service_error_for_status()
-            .await?
-            .protobuf()
-            .await
+        response.service_error_for_status().await?.protobuf().await
     }
 
-    /// Fetches the group change log from `from_revision` (inclusive) onward.
+    /// Fetches what an invite-link holder may see of a group before joining.
     ///
-    /// Lets a client that is only a few revisions behind apply signed changes
-    /// in order instead of refetching full state.
+    /// Authenticates with the group credential derived from the master key in
+    /// the link; the password (base64url) proves the link itself. A 403 means
+    /// the link was disabled or its password rotated.
     ///
-    /// Java equivalent: `PushServiceSocket.getGroupsV2Logs`.
-    pub(crate) async fn get_group_logs(
+    /// Java equivalent: `PushServiceSocket.getGroupJoinInfo`.
+    pub(crate) async fn get_group_join_info(
         &mut self,
         credentials: HttpAuth,
-        from_revision: u32,
-    ) -> Result<crate::proto::GroupChanges, ServiceError> {
+        password: &str,
+    ) -> Result<crate::proto::GroupJoinInfo, ServiceError> {
         self.request(
             Method::GET,
-            Endpoint::storage(format!("/v1/groups/logs/{from_revision}")),
+            Endpoint::storage(format!("/v1/groups/join/{password}")),
             HttpAuthOverride::Identified(credentials),
         )?
         .send()
@@ -287,6 +312,107 @@ impl PushService {
         .await?
         .protobuf()
         .await
+    }
+
+    /// Fetches a one-shot upload form for a group avatar. The returned key is
+    /// what a `ModifyAvatarAction` then references.
+    ///
+    /// Java equivalent: `PushServiceSocket.getGroupsV2AvatarUploadForm`.
+    pub(crate) async fn get_group_avatar_upload_form(
+        &mut self,
+        credentials: HttpAuth,
+    ) -> Result<crate::proto::AvatarUploadAttributes, ServiceError> {
+        self.request(
+            Method::GET,
+            Endpoint::storage("/v1/groups/avatar/form"),
+            HttpAuthOverride::Identified(credentials),
+        )?
+        .send()
+        .await?
+        .service_error_for_status()
+        .await?
+        .protobuf()
+        .await
+    }
+
+    /// Fetches one page of the group change log from `from_revision`
+    /// (inclusive) onward.
+    ///
+    /// The server pages long histories: a 206 with
+    /// `Content-Range: versions a-b/c` means more follows from `b + 1`, which
+    /// is returned as `next_revision`. `max_change_epoch` caps the action
+    /// types we claim to understand so the server can elide newer ones.
+    ///
+    /// Java equivalent: `PushServiceSocket.getGroupsV2GroupHistory`.
+    pub(crate) async fn get_group_logs(
+        &mut self,
+        credentials: HttpAuth,
+        from_revision: u32,
+        max_change_epoch: u32,
+        include_first_state: bool,
+    ) -> Result<GroupLogsPage, ServiceError> {
+        let path = format!(
+            "/v1/groups/logs/{from_revision}?maxSupportedChangeEpoch={max_change_epoch}&includeFirstState={include_first_state}&includeLastState=false"
+        );
+        let response = self
+            .request(
+                Method::GET,
+                Endpoint::storage(path),
+                HttpAuthOverride::Identified(credentials),
+            )?
+            .send()
+            .await?
+            .service_error_for_status()
+            .await?;
+
+        let next_revision =
+            if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+                response
+                    .headers()
+                    .get(reqwest::header::CONTENT_RANGE)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(parse_versions_content_range)
+                    .map(|(_, last)| last + 1)
+            } else {
+                None
+            };
+
+        Ok(GroupLogsPage {
+            changes: response.protobuf().await?,
+            next_revision,
+        })
+    }
+}
+
+/// One page of the group change log.
+#[derive(Debug)]
+pub struct GroupLogsPage {
+    pub changes: crate::proto::GroupChanges,
+    /// Where the next page starts, if the server had more.
+    pub next_revision: Option<u32>,
+}
+
+/// Parses `versions 4-9/12` into `(4, 9)`.
+fn parse_versions_content_range(value: &str) -> Option<(u32, u32)> {
+    let range = value.trim().strip_prefix("versions")?.trim();
+    let (span, _total) = range.split_once('/').unwrap_or((range, ""));
+    let (first, last) = span.split_once('-')?;
+    Some((first.trim().parse().ok()?, last.trim().parse().ok()?))
+}
+
+#[cfg(test)]
+mod group_logs_tests {
+    use super::parse_versions_content_range;
+
+    #[test]
+    fn content_range_parses_signal_format() {
+        assert_eq!(
+            parse_versions_content_range("versions 4-9/12"),
+            Some((4, 9))
+        );
+        assert_eq!(parse_versions_content_range("versions 0-0"), Some((0, 0)));
+        assert_eq!(parse_versions_content_range("bytes 0-9/12"), None);
+        assert_eq!(parse_versions_content_range("versions x-9"), None);
     }
 }
 

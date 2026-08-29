@@ -297,3 +297,17 @@ impl TryFrom<crate::proto::AccessControl> for AccessControl {
         })
     }
 }
+
+/// What a holder of an invite link can learn about a group before joining.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroupJoinInfo {
+    pub title: String,
+    pub description: Option<String>,
+    pub avatar: String,
+    pub member_count: u32,
+    pub add_from_invite_link: AccessRequired,
+    pub version: u32,
+    /// Whether joining will land in the admin-approval queue rather than in
+    /// the member list.
+    pub pending_admin_approval: bool,
+}

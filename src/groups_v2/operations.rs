@@ -24,8 +24,8 @@ use crate::{
 
 use super::{
     model::{
-        AccessControl, BannedMember, GroupMemberCandidate, Member,
-        PendingMember, PromotedMember, RequestingMember,
+        AccessControl, AccessRequired, BannedMember, GroupMemberCandidate,
+        Member, PendingMember, PromotedMember, RequestingMember,
     },
     Group, GroupChange, GroupChanges,
 };
@@ -1071,10 +1071,7 @@ impl GroupOperations {
     /// itself.
     ///
     /// [`Actions`]: proto::group_change::Actions
-    pub fn build_actions(
-        &self,
-        revision: u32,
-    ) -> proto::group_change::Actions {
+    pub fn build_actions(&self, revision: u32) -> proto::group_change::Actions {
         proto::group_change::Actions {
             version: revision,
             ..Default::default()
@@ -1290,6 +1287,214 @@ impl GroupOperations {
     }
 }
 
+/// One decrypted entry of the group change log.
+#[derive(Debug, Clone)]
+pub struct GroupLogEntry {
+    pub change: GroupChanges,
+    /// Full state after the change, when the server included it (only the
+    /// first entry of a log page requested with `includeFirstState`).
+    pub state: Option<Group>,
+}
+
+impl GroupOperations {
+    /// Encrypts avatar bytes for upload to the groups avatar CDN.
+    pub fn encrypt_avatar<R: rand::Rng + rand::CryptoRng>(
+        &self,
+        avatar: &[u8],
+        rng: &mut R,
+    ) -> Vec<u8> {
+        self.encrypt_blob_content(
+            group_attribute_blob::Content::Avatar(avatar.to_vec()),
+            rng,
+        )
+    }
+
+    /// Decrypts the preview a server returns for an invite link.
+    pub fn decrypt_group_join_info(
+        &self,
+        info: proto::GroupJoinInfo,
+    ) -> Result<super::model::GroupJoinInfo, GroupDecodingError> {
+        let proto::GroupJoinInfo {
+            public_key: _,
+            title,
+            description,
+            avatar,
+            member_count,
+            add_from_invite_link,
+            version,
+            pending_admin_approval,
+        } = info;
+        Ok(super::model::GroupJoinInfo {
+            title: self.decrypt_title(&title),
+            description: self.decrypt_description_text(&description),
+            avatar,
+            member_count,
+            add_from_invite_link: add_from_invite_link.try_into()?,
+            version,
+            pending_admin_approval,
+        })
+    }
+
+    /// Decrypts a page of the change log, in order.
+    ///
+    /// An entry whose change is missing (the server elides changes older
+    /// than the requester's membership) is skipped rather than failing the
+    /// whole page.
+    pub fn decrypt_group_logs(
+        &self,
+        logs: proto::GroupChanges,
+    ) -> Result<Vec<GroupLogEntry>, GroupDecodingError> {
+        logs.group_changes
+            .into_iter()
+            .filter_map(|entry| {
+                let change = entry.group_change?;
+                Some((change, entry.group_state))
+            })
+            .map(|(change, state)| {
+                Ok(GroupLogEntry {
+                    change: self.decrypt_group_change(change)?,
+                    state: state.map(|s| self.decrypt_group(s)).transpose()?,
+                })
+            })
+            .collect()
+    }
+
+    /// Builds actions pointing the group at a newly uploaded avatar.
+    ///
+    /// `avatar_key` is the CDN key returned by the avatar upload form; an
+    /// empty string clears the avatar.
+    pub fn build_modify_avatar_actions(
+        &self,
+        avatar_key: &str,
+        revision: u32,
+    ) -> proto::group_change::Actions {
+        let mut actions = self.build_actions(revision);
+        actions.modify_avatar =
+            Some(proto::group_change::actions::ModifyAvatarAction {
+                avatar: avatar_key.to_string(),
+            });
+        actions
+    }
+
+    /// Builds actions configuring the invite link.
+    ///
+    /// `access` is what a link holder becomes on joining: `Any` — a member
+    /// immediately; `Administrator` — a requesting member awaiting approval;
+    /// `Unsatisfiable` — the link is disabled. A new `password` is set when
+    /// given; the server keeps the old one otherwise, so enabling a link
+    /// whose password is still empty must always pass one.
+    pub fn build_modify_invite_link_actions(
+        &self,
+        access: Option<AccessRequired>,
+        password: Option<&[u8]>,
+        revision: u32,
+    ) -> proto::group_change::Actions {
+        let mut actions = self.build_actions(revision);
+        if let Some(access) = access {
+            actions.modify_add_from_invite_link_access = Some(
+                proto::group_change::actions::ModifyAddFromInviteLinkAccessControlAction {
+                    add_from_invite_link_access: access.into(),
+                },
+            );
+        }
+        if let Some(password) = password {
+            actions.modify_invite_link_password = Some(
+                proto::group_change::actions::ModifyInviteLinkPasswordAction {
+                    invite_link_password: password.to_vec(),
+                },
+            );
+        }
+        actions
+    }
+
+    /// Builds the actions for joining through an invite link.
+    ///
+    /// Depending on the group's `add_from_invite_link` access this is either
+    /// a direct add (`join_from_invite_link` flagged, so members see "joined
+    /// via link") or a join request queued for admin approval. Either way
+    /// the presentation is our own profile key credential; the server fills
+    /// in `user_id`/`profile_key` from it. Must be submitted with the link
+    /// password, see [`GroupsManager::patch_encrypted_group_via_invite_link`].
+    ///
+    /// [`GroupsManager::patch_encrypted_group_via_invite_link`]: super::GroupsManager::patch_encrypted_group_via_invite_link
+    pub fn build_join_via_invite_link_actions(
+        &self,
+        server_public_params: &ServerPublicParams,
+        self_credential: &ExpiringProfileKeyCredential,
+        requires_admin_approval: bool,
+        revision: u32,
+    ) -> proto::group_change::Actions {
+        let presentation = self
+            .create_member_presentation(server_public_params, self_credential);
+        let mut actions = self.build_actions(revision);
+        if requires_admin_approval {
+            actions.add_members_pending_admin_approval = vec![
+                proto::group_change::actions::AddMemberPendingAdminApprovalAction {
+                    added: Some(proto::MemberPendingAdminApproval {
+                        user_id: vec![],
+                        profile_key: vec![],
+                        presentation,
+                        timestamp: 0,
+                    }),
+                },
+            ];
+        } else {
+            actions.add_members =
+                vec![proto::group_change::actions::AddMemberAction {
+                    added: Some(EncryptedMember {
+                        user_id: vec![],
+                        profile_key: vec![],
+                        presentation,
+                        role: proto::member::Role::Default.into(),
+                        joined_at_version: 0,
+                        label_emoji: vec![],
+                        label_string: vec![],
+                    }),
+                    join_from_invite_link: true,
+                }];
+        }
+        actions
+    }
+
+    /// Builds actions approving join requests: each requester becomes a
+    /// default member.
+    pub fn build_approve_join_requests_actions(
+        &self,
+        acis: impl IntoIterator<Item = Aci>,
+        revision: u32,
+    ) -> Result<proto::group_change::Actions, GroupDecodingError> {
+        let mut actions = self.build_actions(revision);
+        actions.promote_members_pending_admin_approval = acis
+            .into_iter()
+            .map(|aci| {
+                Ok(proto::group_change::actions::PromoteMemberPendingAdminApprovalAction {
+                    user_id: self.encrypt_aci(aci)?,
+                    role: proto::member::Role::Default.into(),
+                })
+            })
+            .collect::<Result<_, GroupDecodingError>>()?;
+        Ok(actions)
+    }
+
+    /// Builds actions denying (or, for oneself, withdrawing) join requests.
+    pub fn build_deny_join_requests_actions(
+        &self,
+        acis: impl IntoIterator<Item = Aci>,
+        revision: u32,
+    ) -> Result<proto::group_change::Actions, GroupDecodingError> {
+        let mut actions = self.build_actions(revision);
+        actions.delete_members_pending_admin_approval = acis
+            .into_iter()
+            .map(|aci| {
+                Ok(proto::group_change::actions::DeleteMemberPendingAdminApprovalAction {
+                    deleted_user_id: self.encrypt_aci(aci)?,
+                })
+            })
+            .collect::<Result<_, GroupDecodingError>>()?;
+        Ok(actions)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1432,6 +1637,48 @@ mod tests {
         assert_ne!(encrypted1, encrypted2);
         assert_eq!(ops.decrypt_title(&encrypted1), title);
         assert_eq!(ops.decrypt_title(&encrypted2), title);
+    }
+
+    fn test_server_params() -> zkgroup::ServerSecretParams {
+        zkgroup::ServerSecretParams::generate([0u8; 32])
+    }
+
+    /// Issues a real credential for `test_aci` the way the server would, so
+    /// presentation-building code paths run against genuine zkgroup types.
+    fn test_credential(
+        params: &zkgroup::ServerSecretParams,
+    ) -> ExpiringProfileKeyCredential {
+        let aci = test_aci();
+        let profile_key = ProfileKey::create([1u8; 32]);
+        let public = params.get_public_params();
+        let context = public.create_profile_key_credential_request_context(
+            [2u8; 32],
+            aci,
+            profile_key,
+        );
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let day = 24 * 60 * 60;
+        let expiration =
+            zkgroup::Timestamp::from_epoch_seconds((now / day + 2) * day);
+        let response = params
+            .issue_expiring_profile_key_credential(
+                [3u8; 32],
+                &context.get_request(),
+                aci,
+                profile_key.get_commitment(aci),
+                expiration,
+            )
+            .expect("issue credential");
+        public
+            .receive_expiring_profile_key_credential(
+                &context,
+                &response,
+                zkgroup::Timestamp::from_epoch_seconds(now),
+            )
+            .expect("receive credential")
     }
 
     fn test_aci() -> Aci {
@@ -1598,13 +1845,165 @@ mod tests {
 
         // This is exactly what goes in the PATCH body.
         let encoded = prost::Message::encode_to_vec(&actions);
-        let decoded =
-            <proto::group_change::Actions as prost::Message>::decode(
-                encoded.as_slice(),
-            )
-            .expect("actions roundtrip through prost");
+        let decoded = <proto::group_change::Actions as prost::Message>::decode(
+            encoded.as_slice(),
+        )
+        .expect("actions roundtrip through prost");
 
         assert_eq!(decoded, actions);
         assert_eq!(decoded.version, 12);
+    }
+
+    #[test]
+    fn roundtrip_avatar() {
+        let ops = create_group_operations();
+        let mut rng = rand::rng();
+        let avatar = b"\x89PNG not really".to_vec();
+        let encrypted = ops.encrypt_avatar(&avatar, &mut rng);
+        assert_eq!(ops.decrypt_avatar(&encrypted), Some(avatar));
+        // An empty avatar decrypts to "none", matching the read path.
+        let empty = ops.encrypt_avatar(&[], &mut rng);
+        assert_eq!(ops.decrypt_avatar(&empty), None);
+    }
+
+    #[test]
+    fn invite_link_actions_only_carry_what_was_asked() {
+        let ops = create_group_operations();
+        let disable = ops.build_modify_invite_link_actions(
+            Some(AccessRequired::Unsatisfiable),
+            None,
+            4,
+        );
+        assert_eq!(disable.version, 4);
+        assert!(disable.modify_invite_link_password.is_none());
+        assert_eq!(
+            disable
+                .modify_add_from_invite_link_access
+                .unwrap()
+                .add_from_invite_link_access,
+            i32::from(AccessRequired::Unsatisfiable)
+        );
+
+        let password = vec![9u8; 16];
+        let enable = ops.build_modify_invite_link_actions(
+            Some(AccessRequired::Any),
+            Some(&password),
+            5,
+        );
+        assert_eq!(
+            enable
+                .modify_invite_link_password
+                .unwrap()
+                .invite_link_password,
+            password
+        );
+    }
+
+    #[test]
+    fn join_actions_pick_direct_add_or_request_by_approval_flag() {
+        let ops = create_group_operations();
+        let params = test_server_params();
+        let credential = test_credential(&params);
+
+        let direct = ops.build_join_via_invite_link_actions(
+            &params.get_public_params(),
+            &credential,
+            false,
+            2,
+        );
+        assert_eq!(direct.add_members.len(), 1);
+        assert!(direct.add_members[0].join_from_invite_link);
+        assert!(direct.add_members_pending_admin_approval.is_empty());
+        let added = direct.add_members[0].added.as_ref().unwrap();
+        assert!(added.user_id.is_empty() && added.profile_key.is_empty());
+        assert!(!added.presentation.is_empty());
+
+        let request = ops.build_join_via_invite_link_actions(
+            &params.get_public_params(),
+            &credential,
+            true,
+            2,
+        );
+        assert!(request.add_members.is_empty());
+        assert_eq!(request.add_members_pending_admin_approval.len(), 1);
+    }
+
+    #[test]
+    fn join_request_decisions_round_trip_the_requester() {
+        let ops = create_group_operations();
+        let aci = test_aci();
+
+        let approve =
+            ops.build_approve_join_requests_actions([aci], 3).unwrap();
+        let promoted = &approve.promote_members_pending_admin_approval[0];
+        assert_eq!(ops.decrypt_aci(&promoted.user_id).unwrap(), aci);
+        assert_eq!(promoted.role, i32::from(proto::member::Role::Default));
+
+        let deny = ops.build_deny_join_requests_actions([aci], 3).unwrap();
+        let deleted = &deny.delete_members_pending_admin_approval[0];
+        assert_eq!(ops.decrypt_aci(&deleted.deleted_user_id).unwrap(), aci);
+    }
+
+    #[test]
+    fn join_info_round_trips_through_encryption() {
+        let ops = create_group_operations();
+        let mut rng = rand::rng();
+        let info = proto::GroupJoinInfo {
+            public_key: vec![],
+            title: ops.encrypt_title("Linkable", &mut rng),
+            description: ops.encrypt_description(Some("open"), &mut rng),
+            avatar: "groups/abc".into(),
+            member_count: 3,
+            add_from_invite_link: AccessRequired::Administrator.into(),
+            version: 12,
+            pending_admin_approval: true,
+        };
+        let decrypted = ops.decrypt_group_join_info(info).unwrap();
+        assert_eq!(decrypted.title, "Linkable");
+        assert_eq!(decrypted.description.as_deref(), Some("open"));
+        assert_eq!(
+            decrypted.add_from_invite_link,
+            AccessRequired::Administrator
+        );
+        assert_eq!(decrypted.version, 12);
+        assert!(decrypted.pending_admin_approval);
+    }
+
+    #[test]
+    fn group_logs_skip_elided_changes_but_keep_state() {
+        let ops = create_group_operations();
+        let mut rng = rand::rng();
+        // A change with an unsigned, empty action set is enough for the
+        // decoder: we only exercise the page plumbing here.
+        let mut actions = ops.build_modify_title_actions("t", 7, &mut rng);
+        // The server stamps the editor and group id on every stored change.
+        actions.source_user_id = ops.encrypt_aci(test_aci()).unwrap();
+        actions.group_id = vec![0u8; 32];
+        let change = proto::GroupChange {
+            actions: actions.encode_to_vec(),
+            server_signature: vec![],
+            change_epoch: 0,
+        };
+        let logs = proto::GroupChanges {
+            group_changes: vec![
+                proto::group_changes::GroupChangeState {
+                    group_change: None,
+                    group_state: None,
+                },
+                proto::group_changes::GroupChangeState {
+                    group_change: Some(change),
+                    group_state: Some(proto::Group {
+                        title: ops.encrypt_title("t", &mut rng),
+                        version: 7,
+                        ..Default::default()
+                    }),
+                },
+            ],
+            group_send_endorsements_response: vec![],
+        };
+        let entries = ops.decrypt_group_logs(logs).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].change.version, 7);
+        assert_eq!(entries[0].state.as_ref().unwrap().title, "t");
     }
 }
