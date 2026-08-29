@@ -753,10 +753,19 @@ impl GroupOperations {
             .chain(modify_member_label_access)
             .collect();
 
-        Ok(GroupChanges {
-            group_id: group_id
+        // Announced changes carry the group id; entries read back from the
+        // change log do not, but the id is a pure function of the secret
+        // params we are decrypting with anyway.
+        let group_id = if group_id.is_empty() {
+            self.group_secret_params.get_group_identifier()
+        } else {
+            group_id
                 .try_into()
-                .map_err(|_| GroupDecodingError::WrongBlob)?,
+                .map_err(|_| GroupDecodingError::WrongBlob)?
+        };
+
+        Ok(GroupChanges {
+            group_id,
             editor: source_user_id,
             version,
             changes: changes?,
@@ -1976,9 +1985,9 @@ mod tests {
         // A change with an unsigned, empty action set is enough for the
         // decoder: we only exercise the page plumbing here.
         let mut actions = ops.build_modify_title_actions("t", 7, &mut rng);
-        // The server stamps the editor and group id on every stored change.
+        // The server stamps the editor on every stored change, but log
+        // entries (unlike announced changes) carry no group id.
         actions.source_user_id = ops.encrypt_aci(test_aci()).unwrap();
-        actions.group_id = vec![0u8; 32];
         let change = proto::GroupChange {
             actions: actions.encode_to_vec(),
             server_signature: vec![],
@@ -2004,6 +2013,10 @@ mod tests {
         let entries = ops.decrypt_group_logs(logs).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].change.version, 7);
+        assert_eq!(
+            entries[0].change.group_id,
+            ops.group_secret_params.get_group_identifier()
+        );
         assert_eq!(entries[0].state.as_ref().unwrap().title, "t");
     }
 }
