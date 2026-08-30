@@ -1419,8 +1419,8 @@ impl GroupOperations {
     /// Builds the actions for joining through an invite link.
     ///
     /// Depending on the group's `add_from_invite_link` access this is either
-    /// a direct add (`join_from_invite_link` flagged, so members see "joined
-    /// via link") or a join request queued for admin approval. Either way
+    /// a direct add (the server flags it `join_from_invite_link`, so members
+    /// see "joined via link") or a join request queued for admin approval. Either way
     /// the presentation is our own profile key credential; the server fills
     /// in `user_id`/`profile_key` from it. Must be submitted with the link
     /// password, see [`GroupsManager::patch_encrypted_group_via_invite_link`].
@@ -1459,7 +1459,11 @@ impl GroupOperations {
                         label_emoji: vec![],
                         label_string: vec![],
                     }),
-                    join_from_invite_link: true,
+                    // Never set by the client: the server rejects it with
+                    // 400 "Invalid field set on action" and stamps the
+                    // flag itself once the link password checks out
+                    // (storage-service GroupValidator.validateAddMember).
+                    join_from_invite_link: false,
                 }];
         }
         actions
@@ -1921,7 +1925,8 @@ mod tests {
             2,
         );
         assert_eq!(direct.add_members.len(), 1);
-        assert!(direct.add_members[0].join_from_invite_link);
+        // The server sets join_from_invite_link; a client that does is 400'd.
+        assert!(!direct.add_members[0].join_from_invite_link);
         assert!(direct.add_members_pending_admin_approval.is_empty());
         let added = direct.add_members[0].added.as_ref().unwrap();
         assert!(added.user_id.is_empty() && added.profile_key.is_empty());
