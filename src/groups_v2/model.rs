@@ -164,7 +164,10 @@ pub struct Group {
 #[derive(Debug, Clone)]
 pub struct GroupChanges {
     pub group_id: GroupV2Id,
-    pub editor: Aci,
+    /// Who made the change. Usually an ACI, but a member accepting a
+    /// *PNI-addressed* invite is authenticated — and therefore stamped by
+    /// the server — as their PNI.
+    pub editor: ServiceId,
     pub version: u32,
     pub changes: Vec<GroupChange>,
     pub change_epoch: u32,

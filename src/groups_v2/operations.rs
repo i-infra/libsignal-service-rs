@@ -548,7 +548,9 @@ impl GroupOperations {
             modify_member_label_access,
         } = Message::decode(Bytes::from(actions))?;
 
-        let source_user_id = self.decrypt_aci(&source_user_id)?;
+        // Not always an ACI: accepting a PNI invite is authored *as* the
+        // PNI, and the server stamps the matching ciphertext.
+        let source_user_id = self.decrypt_service_id(&source_user_id)?;
 
         let new_members =
             add_members
@@ -1489,6 +1491,130 @@ impl GroupOperations {
         Ok(actions)
     }
 
+    /// Builds actions changing who may edit group attributes (title,
+    /// description, avatar, timer). `Member` or `Administrator` only —
+    /// the server rejects other values here.
+    pub fn build_modify_attributes_access_actions(
+        &self,
+        access: AccessRequired,
+        revision: u32,
+    ) -> proto::group_change::Actions {
+        let mut actions = self.build_actions(revision);
+        actions.modify_attributes_access = Some(
+            proto::group_change::actions::ModifyAttributesAccessControlAction {
+                attributes_access: access.into(),
+            },
+        );
+        actions
+    }
+
+    /// Builds actions changing who may edit membership (add/remove/invite).
+    /// `Member` or `Administrator` only.
+    pub fn build_modify_members_access_actions(
+        &self,
+        access: AccessRequired,
+        revision: u32,
+    ) -> proto::group_change::Actions {
+        let mut actions = self.build_actions(revision);
+        actions.modify_member_access = Some(
+            proto::group_change::actions::ModifyMembersAccessControlAction {
+                members_access: access.into(),
+            },
+        );
+        actions
+    }
+
+    /// Builds actions toggling announcements-only mode.
+    ///
+    /// The flag is advisory: the groups server stores it and clients stop
+    /// non-admins from sending, but message delivery itself is not gated
+    /// server-side (message sends never touch the groups server).
+    pub fn build_modify_announcements_only_actions(
+        &self,
+        announcements_only: bool,
+        revision: u32,
+    ) -> proto::group_change::Actions {
+        let mut actions = self.build_actions(revision);
+        actions.modify_announcements_only = Some(
+            proto::group_change::actions::ModifyAnnouncementsOnlyAction {
+                announcements_only,
+            },
+        );
+        actions
+    }
+
+    /// Builds actions banning service ids from the group.
+    ///
+    /// A banned id cannot rejoin through an invite link (the server answers
+    /// its join attempts with 403 `banned`). Banning does not remove a
+    /// current member — pair with a `DeleteMemberAction` for that. The
+    /// timestamp is left at 0: the server stamps its own clock.
+    pub fn build_ban_members_actions(
+        &self,
+        service_ids: impl IntoIterator<Item = ServiceId>,
+        revision: u32,
+    ) -> Result<proto::group_change::Actions, GroupDecodingError> {
+        let mut actions = self.build_actions(revision);
+        actions.add_members_banned = service_ids
+            .into_iter()
+            .map(|id| {
+                Ok(proto::group_change::actions::AddMemberBannedAction {
+                    added: Some(proto::MemberBanned {
+                        user_id: self.encrypt_service_id(id)?,
+                        timestamp: 0,
+                    }),
+                })
+            })
+            .collect::<Result<_, GroupDecodingError>>()?;
+        Ok(actions)
+    }
+
+    /// Builds actions lifting bans.
+    pub fn build_unban_members_actions(
+        &self,
+        service_ids: impl IntoIterator<Item = ServiceId>,
+        revision: u32,
+    ) -> Result<proto::group_change::Actions, GroupDecodingError> {
+        let mut actions = self.build_actions(revision);
+        actions.delete_members_banned = service_ids
+            .into_iter()
+            .map(|id| {
+                Ok(proto::group_change::actions::DeleteMemberBannedAction {
+                    deleted_user_id: self.encrypt_service_id(id)?,
+                })
+            })
+            .collect::<Result<_, GroupDecodingError>>()?;
+        Ok(actions)
+    }
+
+    /// Builds actions accepting an invitation that was addressed to our
+    /// *PNI* — the phone-number-visible flavour of an invite, used when the
+    /// inviter knew our number but not our ACI.
+    ///
+    /// The server replaces the PNI pending entry with a full ACI membership
+    /// extracted from the presentation, exactly like
+    /// [`build_promote_pending_member_actions`] does for an ACI invite
+    /// (Android: `createAcceptPniInviteChange`).
+    pub fn build_promote_pending_pni_member_actions(
+        &self,
+        server_public_params: &ServerPublicParams,
+        self_credential: &ExpiringProfileKeyCredential,
+        revision: u32,
+    ) -> proto::group_change::Actions {
+        let presentation = self
+            .create_member_presentation(server_public_params, self_credential);
+        let mut actions = self.build_actions(revision);
+        actions.promote_members_pending_pni_aci_profile_key = vec![
+            proto::group_change::actions::PromoteMemberPendingPniAciProfileKeyAction {
+                presentation,
+                user_id: vec![],
+                pni: vec![],
+                profile_key: vec![],
+            },
+        ];
+        actions
+    }
+
     /// Builds actions denying (or, for oneself, withdrawing) join requests.
     pub fn build_deny_join_requests_actions(
         &self,
@@ -2023,5 +2149,71 @@ mod tests {
             ops.group_secret_params.get_group_identifier()
         );
         assert_eq!(entries[0].state.as_ref().unwrap().title, "t");
+    }
+
+    #[test]
+    fn access_and_announcement_actions_set_only_their_field() {
+        let ops = create_group_operations();
+        let a = ops.build_modify_attributes_access_actions(
+            AccessRequired::Administrator,
+            5,
+        );
+        assert_eq!(
+            a.modify_attributes_access.unwrap().attributes_access,
+            i32::from(AccessRequired::Administrator)
+        );
+        assert!(a.modify_member_access.is_none());
+
+        let m =
+            ops.build_modify_members_access_actions(AccessRequired::Member, 6);
+        assert_eq!(
+            m.modify_member_access.unwrap().members_access,
+            i32::from(AccessRequired::Member)
+        );
+        assert!(m.modify_attributes_access.is_none());
+
+        let on = ops.build_modify_announcements_only_actions(true, 7);
+        assert!(on.modify_announcements_only.unwrap().announcements_only);
+        let off = ops.build_modify_announcements_only_actions(false, 8);
+        assert!(!off.modify_announcements_only.unwrap().announcements_only);
+    }
+
+    #[test]
+    fn ban_and_unban_round_trip_the_service_id() {
+        let ops = create_group_operations();
+        let id = ServiceId::from(test_aci());
+
+        let ban = ops.build_ban_members_actions([id], 3).unwrap();
+        let added = ban.add_members_banned[0].added.as_ref().unwrap();
+        assert_eq!(ops.decrypt_service_id(&added.user_id).unwrap(), id);
+        // Server stamps the ban time; a client-set one would be a lie.
+        assert_eq!(added.timestamp, 0);
+
+        let unban = ops.build_unban_members_actions([id], 4).unwrap();
+        assert_eq!(
+            ops.decrypt_service_id(
+                &unban.delete_members_banned[0].deleted_user_id
+            )
+            .unwrap(),
+            id
+        );
+    }
+
+    #[test]
+    fn pni_promotion_carries_only_a_presentation() {
+        let ops = create_group_operations();
+        let params = test_server_params();
+        let credential = test_credential(&params);
+        let actions = ops.build_promote_pending_pni_member_actions(
+            &params.get_public_params(),
+            &credential,
+            9,
+        );
+        let action = &actions.promote_members_pending_pni_aci_profile_key[0];
+        assert!(!action.presentation.is_empty());
+        assert!(action.user_id.is_empty());
+        assert!(action.pni.is_empty());
+        assert!(action.profile_key.is_empty());
+        assert!(actions.promote_members_pending_profile_key.is_empty());
     }
 }
